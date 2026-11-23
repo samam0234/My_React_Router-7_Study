@@ -1,0 +1,152 @@
+name: course
+
+# 푸시·PR마다: 타입 검사 → 단위 테스트 → 빌드 → 요청 테스트.
+# 마스터에 합쳐지면: DB 3종 실제 접속 시험 → 이미지 빌드 → (설정했을 때만) 배포.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+concurrency:
+  group: course-${{ github.ref }}
+  cancel-in-progress: true # 같은 브랜치에 새 푸시가 오면 이전 실행을 취소한다
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.app }} 검증
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [midpoint, project]
+    defaults:
+      run:
+        working-directory: ${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run test:requests
+      - name: MCP·백업 시험 (project만)
+        if: matrix.app == 'project'
+        run: |
+          npm run mcp:test
+          node tools/backup-test.mjs
+
+  databases:
+    name: DB 3종 실제 접속 시험
+    runs-on: ubuntu-latest
+    needs: verify
+    defaults:
+      run:
+        working-directory: project
+    # 서비스 컨테이너: 이 작업이 끝나면 함께 사라진다. 비밀번호는 CI 안에서만 쓰는 임시 값이다.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_USER: rr7, POSTGRES_PASSWORD: ci-only, POSTGRES_DB: board }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rr7 -d board" --health-interval 5s --health-timeout 3s --health-retries 10
+      mariadb:
+        image: mariadb:11
+        env: { MARIADB_ROOT_PASSWORD: ci-only, MARIADB_DATABASE: board }
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 3s --health-retries 20
+      mongo:
+        image: mongo:8
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval \"db.adminCommand('ping').ok\"" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      E2E_POSTGRES_URL: postgres://rr7:ci-only@localhost:5432/board
+      E2E_MARIADB_URL: mariadb://root:ci-only@localhost:3306/board
+      E2E_MONGO_URL: mongodb://localhost:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm, cache-dependency-path: project/package-lock.json }
+      - run: npm ci
+      - run: npm run build
+      - name: 저장소 계약 시험(드라이버별)
+        run: npx vitest run tests/repo-contract.test.ts
+        env:
+          TEST_POSTGRES_URL: postgres://rr7:ci-only@localhost:5432/board
+          TEST_MARIADB_URL: mariadb://root:ci-only@localhost:3306/board
+          TEST_MONGO_URL: mongodb://localhost:27017/board_ci
+      - name: 같은 요청 테스트를 DB마다 전체 실행
+        run: node tools/db-e2e.mjs
+
+  image:
+    name: 도커 이미지 빌드
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: project
+          push: false
+          load: true
+          tags: rr7-project:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: 컨테이너가 실제로 뜨고 /health에 응답하는지
+        run: |
+          docker run -d --name app -p 3000:3000 \
+            -e SESSION_SECRET=ci-session-secret-0123456789abcdef \
+            -e JWT_SECRET=ci-jwt-secret-0123456789abcdefghij \
+            -e COOKIE_SECURE=false rr7-project:ci
+          for i in $(seq 1 20); do curl -fs localhost:3000/health && exit 0; sleep 1; done
+          docker logs app; exit 1
+
+  deploy:
+    name: 배포 (설정했을 때만)
+    runs-on: ubuntu-latest
+    needs: [databases, image]
+    # 저장소 변수 DEPLOY_ENABLED=true 이고 master 푸시일 때만 실행한다. 설정 전에는 건너뛴다.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && vars.DEPLOY_ENABLED == 'true'
+    environment: production # 필요하면 GitHub 환경에 "승인자"를 지정해 사람이 승인해야 배포되게 한다
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      # GHCR 이미지 이름은 소문자만 허용한다. 저장소 이름에 대문자가 있으면 그대로 쓸 수 없어 소문자로 바꾼다.
+      - name: 이미지 이름 만들기
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/rr7-project" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: project
+          push: true
+          # 커밋 해시 태그: 문제가 생기면 이전 해시로 되돌릴 수 있다(latest만 쓰면 되돌릴 기준이 없다).
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+      - name: 서버에서 새 이미지로 교체 (SSH)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          install -m 600 /dev/null key && printf '%s\n' "$DEPLOY_KEY" > key
+          ssh -i key -o StrictHostKeyChecking=accept-new "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd /srv/rr7 && export IMAGE=${{ env.IMAGE }} IMAGE_TAG=${{ github.sha }} && docker compose -f compose.production.yaml pull app && docker compose -f compose.production.yaml up -d && docker compose -f compose.production.yaml ps"
+          rm -f key
