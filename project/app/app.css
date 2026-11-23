@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, "Apple SD Gothic Neo", "Malgun Gothic",
+    "Noto Sans KR", sans-serif;
+}
+
+/* 시스템 설정이 아니라 html 요소의 .dark 클래스로 어두운 테마를 켠다(사용자가 직접 고를 수 있게). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body {
+  @apply bg-white text-gray-900 dark:bg-gray-950 dark:text-gray-100;
+}
+
+html.dark {
+  color-scheme: dark;
+}

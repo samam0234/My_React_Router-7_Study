@@ -1,0 +1,79 @@
+# 기본 실행(app + postgres):   docker compose up -d --build
+# DB 교체 실험(+mariadb +mongo): docker compose --profile databases up -d
+# 아래 비밀번호 기본값은 로컬 학습용이다. 운영에서는 반드시 환경변수 또는 시크릿으로 바꾼다.
+name: rr7-project
+
+services:
+  app:
+    build: .
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      COOKIE_SECURE: "${COOKIE_SECURE:-false}" # HTTPS 뒤에서는 true
+      APP_ORIGIN: "${APP_ORIGIN:-http://localhost:3000}"
+      SESSION_SECRET: "${SESSION_SECRET:?SESSION_SECRET 환경변수가 필요합니다}"
+      JWT_SECRET: "${JWT_SECRET:?JWT_SECRET 환경변수가 필요합니다}"
+      DB_DRIVER: postgres
+      DATABASE_URL: "postgres://rr7:${POSTGRES_PASSWORD:-rr7pass}@postgres:5432/board"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+      UPLOAD_DIR: /app/data/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: rr7
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-rr7pass}"
+      POSTGRES_DB: board
+    ports:
+      - "${POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rr7 -d board"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mariadb:
+    profiles: ["databases"]
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: "${MARIADB_PASSWORD:-rr7pass}"
+      MARIADB_DATABASE: board
+    ports:
+      - "${MARIADB_PORT:-13306}:3306"
+    volumes:
+      - mariadata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mongo:
+    profiles: ["databases"]
+    image: mongo:8
+    ports:
+      - "${MONGO_PORT:-27018}:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  uploads:
+  pgdata:
+  mariadata:
+  mongodata:

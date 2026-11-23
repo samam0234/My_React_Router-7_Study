@@ -1,0 +1,63 @@
+# 운영 서버용. 이미지는 CI가 빌드해 레지스트리에 올린 것을 받아서 쓴다(서버에서 빌드하지 않는다).
+#   서버의 /srv/rr7 에 이 파일, Caddyfile, .env를 두고:
+#   IMAGE=ghcr.io/<소유자>/<저장소>/rr7-project IMAGE_TAG=<커밋해시> docker compose -f compose.production.yaml up -d
+# .env 에는 SESSION_SECRET, JWT_SECRET, POSTGRES_PASSWORD, DOMAIN 등 비밀값을 둔다(Git에 올리지 않는다).
+name: rr7-prod
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443" # 인증서(HTTPS)는 Caddy가 Let's Encrypt에서 자동으로 받고 갱신한다
+    environment:
+      DOMAIN: "${DOMAIN:?DOMAIN 환경변수가 필요합니다 (예: board.example.com)}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # 인증서 저장소. 지우면 인증서를 다시 받아야 한다(발급 횟수 제한 주의)
+    depends_on:
+      - app
+
+  app:
+    image: "${IMAGE:?IMAGE 환경변수가 필요합니다}:${IMAGE_TAG:-latest}"
+    restart: unless-stopped
+    # 포트를 밖으로 열지 않는다. Caddy만 내부망으로 접근한다.
+    expose: ["3000"]
+    environment:
+      NODE_ENV: production
+      COOKIE_SECURE: "true" # HTTPS 뒤이므로 쿠키에 Secure
+      TRUST_PROXY: "1" # Caddy가 붙인 X-Forwarded-For를 신뢰한다
+      APP_ORIGIN: "https://${DOMAIN}"
+      SESSION_SECRET: "${SESSION_SECRET:?필요}"
+      JWT_SECRET: "${JWT_SECRET:?필요}"
+      METRICS_TOKEN: "${METRICS_TOKEN:-}"
+      DB_DRIVER: postgres
+      DATABASE_URL: "postgres://rr7:${POSTGRES_PASSWORD:?필요}@postgres:5432/board"
+      UPLOAD_DIR: /app/data/uploads
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 15s # server.ts가 SIGTERM 후 정리할 시간
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rr7
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?필요}"
+      POSTGRES_DB: board
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rr7 -d board"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  caddy_data:
+  app_data:
+  pgdata:
